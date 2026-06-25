@@ -12,6 +12,9 @@ import {
 import {
   convertEffortValueToLevel,
   type EffortValue,
+  resolveAppliedEffort,
+  modelSupportsShimReasoningEffort,
+  modelSupportsWireEffort,
   standardEffortToOpenAI,
   type OpenAIEffortLevel,
 } from 'src/utils/effort.js'
@@ -44,6 +47,7 @@ import {
   getXiaomiMimoBaseUrlOverride,
   resolveEnvOnlyProviderRouteId,
 } from '../../integrations/routeMetadata.js'
+import { resolveOpenAIShimRuntimeContext } from '../../integrations/runtimeMetadata.js'
 import {
   shouldUseFirstPartyAnthropicAuth,
   type ProviderOverride,
@@ -329,9 +333,48 @@ export async function getAnthropicClient({
 }): Promise<Anthropic> {
   // Convert the runtime effort value to the OpenAI-shaped enum the shim
   // expects. Undefined → shim falls back to descriptor/alias defaults.
+  const effortModel = providerOverride?.model ?? model
+  const providerOverrideRuntimeContext = providerOverride && effortModel
+    ? resolveOpenAIShimRuntimeContext({
+      processEnv: process.env,
+      baseUrl: providerOverride.baseURL,
+      model: effortModel,
+      preferBaseUrlRoute: true,
+    })
+    : undefined
+  const providerOverrideShimConfig = providerOverrideRuntimeContext?.openaiShimConfig
+  const providerOverrideEffortContext = providerOverrideRuntimeContext
+    ? {
+        routeId: providerOverrideRuntimeContext.routeId,
+        useRuntimeFallback: false,
+        openaiShimConfig: providerOverrideShimConfig,
+        apiProvider: providerOverrideRuntimeContext.routeId === 'openai'
+          ? 'openai' as const
+          : providerOverrideRuntimeContext.routeId === 'codex'
+            ? 'codex' as const
+            : undefined,
+      }
+    : undefined
+  const supportsShimReasoningEffort = effortModel
+    ? providerOverrideShimConfig
+      ? modelSupportsShimReasoningEffort(
+        effortModel,
+        providerOverrideShimConfig.thinkingRequestFormat,
+        providerOverrideShimConfig.removeBodyFields,
+        providerOverrideEffortContext,
+      )
+      : modelSupportsWireEffort(effortModel)
+    : false
+  const appliedProviderOverrideEffort = effortModel && effortValue !== undefined
+    ? resolveAppliedEffort(
+      effortModel,
+      effortValue,
+      providerOverrideEffortContext,
+    )
+    : undefined
   const shimReasoningEffort: OpenAIEffortLevel | undefined =
-    effortValue !== undefined
-      ? standardEffortToOpenAI(convertEffortValueToLevel(effortValue))
+    appliedProviderOverrideEffort !== undefined && supportsShimReasoningEffort
+      ? standardEffortToOpenAI(convertEffortValueToLevel(appliedProviderOverrideEffort))
       : undefined
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID

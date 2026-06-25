@@ -357,6 +357,48 @@ test('uses OpenAI-compatible responses endpoint when OPENAI_API_FORMAT=responses
   ])
 })
 
+test('nests reasoning effort for OpenAI-compatible responses endpoint', async () => {
+  process.env.OPENAI_API_FORMAT = 'responses'
+  let capturedBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+
+    return new Response(
+      JSON.stringify({
+        id: 'resp-1',
+        model: 'gpt-5.4',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({ reasoningEffort: 'high' }) as OpenAIShimClient
+
+  await client.beta.messages.create({
+    model: 'gpt-5.4',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedBody?.reasoning).toEqual({ effort: 'high', summary: 'auto' })
+  expect(capturedBody?.include).toEqual(['reasoning.encrypted_content'])
+  expect(capturedBody).not.toHaveProperty('reasoning_effort')
+  expect(capturedBody).not.toHaveProperty('reasoning_summary')
+})
+
 test('uses OpenAI-compatible responses endpoint with text chunk types when OPENAI_API_FORMAT=responses_compat', async () => {
   process.env.OPENAI_API_FORMAT = 'responses_compat'
   let capturedUrl = ''
@@ -6114,6 +6156,41 @@ test('Groq: keeps max_completion_tokens and strips unsupported store', async () 
   expect(requestBody?.store).toBeUndefined()
 })
 
+
+test('Groq: strips reasoning_effort even when compat inference matches the model', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.groq.com/openai/v1'
+  process.env.OPENAI_API_KEY = 'gsk-test'
+
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'deepseek-r1-distill-llama-70b',
+        choices: [
+          { message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+        ],
+        usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({ reasoningEffort: 'xhigh' }) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'deepseek-r1-distill-llama-70b',
+    system: 'you are groq',
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 256,
+    stream: false,
+    thinking: { type: 'enabled' },
+  })
+
+  expect(requestBody?.thinking).toEqual({ type: 'enabled' })
+  expect(requestBody?.reasoning_effort).toBeUndefined()
+  expect(requestBody?.store).toBeUndefined()
+})
 test('Moonshot: echoes reasoning_content on assistant tool-call messages', async () => {
   // Regression for: "API Error: 400 {"error":{"message":"thinking is enabled
   // but reasoning_content is missing in assistant tool call message at index
