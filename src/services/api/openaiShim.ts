@@ -364,6 +364,47 @@ export function hasMistralApiHost(baseUrl: string | undefined): boolean {
   }
 }
 
+function hasNvidiaNimApiHost(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+
+  try {
+    return new URL(baseUrl).hostname.toLowerCase() === 'integrate.api.nvidia.com'
+  } catch {
+    return false
+  }
+}
+
+function setNvidiaNimChatTemplateThinking(body: Record<string, unknown>): void {
+  const existing = body.chat_template_kwargs
+  const kwargs =
+    existing && typeof existing === 'object' && !Array.isArray(existing)
+      ? { ...(existing as Record<string, unknown>) }
+      : {}
+
+  kwargs.thinking = true
+  kwargs.enable_thinking = true
+  body.chat_template_kwargs = kwargs
+}
+
+function maybeSetNvidiaNimChatTemplateThinking(
+  body: Record<string, unknown>,
+  baseUrl: string | undefined,
+  reasoningRequestPlan: {
+    thinkingType?: string
+    reasoningEffort?: string
+  },
+): void {
+  if (!hasNvidiaNimApiHost(baseUrl)) return
+  if (
+    reasoningRequestPlan.thinkingType !== 'enabled' &&
+    !reasoningRequestPlan.reasoningEffort
+  ) {
+    return
+  }
+
+  setNvidiaNimChatTemplateThinking(body)
+}
+
 function formatRetryAfterHint(response: Response): string {
   const ra = response.headers.get('retry-after')
   return ra ? ` (Retry-After: ${ra})` : ''
@@ -3756,6 +3797,7 @@ class OpenAIShimMessages {
       if (reasoningRequestPlan.reasoningEffort) {
         body.reasoning_effort = reasoningRequestPlan.reasoningEffort
       }
+      maybeSetNvidiaNimChatTemplateThinking(body, request.baseUrl, reasoningRequestPlan)
     }
 
     if (reasoningRequestPlan.wireFormat === 'zai_compatible') {
@@ -3769,6 +3811,7 @@ class OpenAIShimMessages {
       } else {
         delete body.reasoning_effort
       }
+      maybeSetNvidiaNimChatTemplateThinking(body, request.baseUrl, reasoningRequestPlan)
     }
 
     // Route/model strip rules are authoritative even when compatibility
