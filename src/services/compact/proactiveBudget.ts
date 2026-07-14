@@ -294,8 +294,8 @@ export function pruneRedundantToolOutputs(
 export function applyProactiveBudget(
   messages: Message[],
 ): ProactiveBudgetResult {
-  // Read user config. 0 or undefined = disabled.
-  const limit = getGlobalConfig().proactiveBudgetLimit ?? 0
+  // Read user config. 0 = disabled. Unset defaults to 100K.
+  const limit = getGlobalConfig().proactiveBudgetLimit ?? PROACTIVE_BUDGET_TARGET_TOKENS_DEFAULT
   if (limit <= 0) {
     return {
       messages,

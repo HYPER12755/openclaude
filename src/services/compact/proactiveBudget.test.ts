@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import type { Message } from '../../types/message.js'
 import { createAssistantMessage, createUserMessage } from '../../utils/messages.js'
+import { saveGlobalConfig } from '../../utils/config.js'
 
 import {
   applyProactiveBudget,
@@ -421,12 +422,39 @@ describe('pruneRedundantToolOutputs', () => {
 // applyProactiveBudget (config-driven integration)
 //
 // applyProactiveBudget reads proactiveBudgetLimit from user config.
-// 0 = disabled. Unset → ?? 0 fallback in code = disabled in test (no config set).
-// In production, the config system defaults proactiveBudgetLimit to 100K.
+// 0 = disabled. Unset → falls back to PROACTIVE_BUDGET_TARGET_TOKENS_DEFAULT (100K).
+// In production, the config system also defaults proactiveBudgetLimit to 100K.
 // ---------------------------------------------------------------------------
 
 describe('applyProactiveBudget', () => {
-  test('no-op when config limit is not set (?? 0 fallback = disabled)', () => {
+  test('prunes redundant outputs when over the configured limit', () => {
+    // Set a small limit so the 4 messages (~500 chars each) exceed it
+    saveGlobalConfig((c) => ({ ...c, proactiveBudgetLimit: 100 }))
+
+    const messages: Message[] = [
+      assistantWithToolUse('Read', 'tool-1', { file_path: '/a.ts' }),
+      userWithToolResult('tool-1', 'x'.repeat(500)),
+      assistantWithToolUse('Read', 'tool-2', { file_path: '/a.ts' }),
+      userWithToolResult('tool-2', 'y'.repeat(500)),
+    ]
+
+    const result = applyProactiveBudget(messages)
+
+    expect(result.wasPruned).toBe(true)
+    expect(result.strippedCount).toBe(1)
+    expect(result.messages).not.toBe(messages)
+
+    // Clean up config state for subsequent tests
+    saveGlobalConfig((c) => {
+      delete (c as Record<string, unknown>).proactiveBudgetLimit
+      return { ...c }
+    })
+  })
+
+  test('no-op when config limit is explicitly 0 (disabled)', () => {
+    // Set config to 0 to disable proactive budget
+    saveGlobalConfig((c) => ({ ...c, proactiveBudgetLimit: 0 }))
+
     const messages: Message[] = [
       assistantWithToolUse('Read', 'tool-1', { file_path: '/a.ts' }),
       userWithToolResult('tool-1', 'x'.repeat(500)),
@@ -439,5 +467,11 @@ describe('applyProactiveBudget', () => {
     expect(result.wasPruned).toBe(false)
     expect(result.strippedCount).toBe(0)
     expect(result.messages).toBe(messages)
+
+    // Clean up config state for subsequent tests
+    saveGlobalConfig((c) => {
+      delete (c as Record<string, unknown>).proactiveBudgetLimit
+      return { ...c }
+    })
   })
 })

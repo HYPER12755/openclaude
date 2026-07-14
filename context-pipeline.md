@@ -44,6 +44,7 @@ Before sending, calculates token estimate via `tokenCountWithEstimation()`:
 ```text
 estimatedTokens = tokenCountWithEstimation(messagesForQuery) - snipTokensFreed
 ```
+
 If `isAtBlockingLimit(estimatedTokens)` is true, the turn is **aborted immediately** with a "conversation is too long" error — never hits the API. This prevents wasting API calls on requests that will get 413'd.
 
 ### Step 11: The API Call
@@ -52,6 +53,7 @@ If `isAtBlockingLimit(estimatedTokens)` is true, the turn is **aborted immediate
 messages = prependUserContext(messagesForQuery, userContext)
 systemPrompt = appendSystemContext(systemPrompt + arc, systemContext)
 ```
+
 Then:
 
 ```typescript
