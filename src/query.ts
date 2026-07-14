@@ -679,7 +679,7 @@ async function* queryLoop(
     // compaction — this is a content-level optimization that reduces raw token
     // count so subsequent passes (autocompact, microcompact, snip) have less work.
     // No-ops when feature flag is off.
-    {
+    if (feature('PROACTIVE_BUDGET')) {
       const budgetResult = applyProactiveBudget(messagesForQuery)
       if (budgetResult.wasPruned) {
         messagesForQuery = budgetResult.messages

@@ -1,4 +1,4 @@
-## Full Context Pipeline: Message → API Call
+# Full Context Pipeline: Message → API Call
 
 Every turn runs through this pipeline in `query.ts` (the `while(true)` loop). Here's each step, in order:
 
@@ -40,18 +40,21 @@ After force compaction check, if the estimated token count exceeds the autocompa
 
 ### Step 10: Blocking Limit Pre-check
 Before sending, calculates token estimate via `tokenCountWithEstimation()`:
-```
+
+```text
 estimatedTokens = tokenCountWithEstimation(messagesForQuery) - snipTokensFreed
 ```
 If `isAtBlockingLimit(estimatedTokens)` is true, the turn is **aborted immediately** with a "conversation is too long" error — never hits the API. This prevents wasting API calls on requests that will get 413'd.
 
 ### Step 11: The API Call
-```
+
+```text
 messages = prependUserContext(messagesForQuery, userContext)
 systemPrompt = appendSystemContext(systemPrompt + arc, systemContext)
 ```
 Then:
-```
+
+```typescript
 deps.callModel({
   messages,         // ← the compiled message list
   systemPrompt,     // ← system + user context + arc
@@ -78,7 +81,7 @@ This is used for the blocking-limit check AND the autocompact threshold decision
 
 ### Summary diagram
 
-```
+```text
 messages[]
   ↓
 [ProactiveBudget] → strip old redundant Read/Write/Edit tool results (never drops messages)

@@ -991,7 +991,7 @@ export const SettingsSchema = lazySchema(() =>
           'Proactive message budget limit in tokens. ' +
             'When set to a positive number (e.g. 50000), old redundant Read/Write/Edit tool results ' +
             'are stripped to stay under this budget, keeping response times fast. ' +
-            '0 or undefined = disabled (send full context, original behavior). ' +
+            'Unset defaults to 100000. Set to 0 to disable (send full context, original behavior). ' +
             'Recommended range: 25000–100000.',
         ),
       ...(process.env.USER_TYPE === 'ant'

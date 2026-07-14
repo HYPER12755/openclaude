@@ -391,18 +391,42 @@ describe('pruneRedundantToolOutputs', () => {
       (messages[1]!.message.content as Array<{ content: string }>)[0]!.content,
     ).toBe(originalContent)
   })
+
+  test('strips older same-file block within a single message (regression)', () => {
+    // Two tool_results for the same file in one user message.
+    // The later block (tool-2) should be preserved, the earlier (tool-1) stripped.
+    const messages: Message[] = [
+      assistantWithToolUse('Read', 'tool-1', { file_path: '/a.ts' }),
+      assistantWithToolUse('Read', 'tool-2', { file_path: '/a.ts' }),
+      createUserMessage({
+        content: [
+          { type: 'tool_result' as const, tool_use_id: 'tool-1', content: 'x'.repeat(500) },
+          { type: 'tool_result' as const, tool_use_id: 'tool-2', content: 'y'.repeat(500) },
+        ],
+      }),
+    ]
+
+    const map = buildToolUseMap(messages)
+    const { messages: result, strippedCount } = pruneRedundantToolOutputs(messages, map)
+
+    expect(strippedCount).toBe(1)
+    const blocks = result[2]!.message.content as Array<{ content: string }>
+    // tool-1 (earlier in array) should be stripped, tool-2 (later) preserved
+    expect(blocks[0]!.content).toBe(strippedMarker('/a.ts'))
+    expect(blocks[1]!.content).toBe('y'.repeat(500))
+  })
 })
 
 // ---------------------------------------------------------------------------
 // applyProactiveBudget (config-driven integration)
 //
 // applyProactiveBudget reads proactiveBudgetLimit from user config.
-// 0 or undefined = disabled. Positive number = target token budget.
-// The pruning logic itself is tested above via pruneRedundantToolOutputs.
+// 0 = disabled. Unset → ?? 0 fallback in code = disabled in test (no config set).
+// In production, the config system defaults proactiveBudgetLimit to 100K.
 // ---------------------------------------------------------------------------
 
 describe('applyProactiveBudget', () => {
-  test('no-op when config limit is not set (default = disabled)', () => {
+  test('no-op when config limit is not set (?? 0 fallback = disabled)', () => {
     const messages: Message[] = [
       assistantWithToolUse('Read', 'tool-1', { file_path: '/a.ts' }),
       userWithToolResult('tool-1', 'x'.repeat(500)),

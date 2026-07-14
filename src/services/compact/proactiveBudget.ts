@@ -22,10 +22,10 @@
  *    in a newer result → strip the content to a short marker.
  * 4. Keep ALL user messages, assistant reasoning/decisions intact — we only
  *    replace the content of tool_result blocks, never remove messages.
- * 5. If still over budget after content-aware pruning, fall back to head/tail
- *    selection (keep first message + last N turns).
+ * 5. If still over budget after content-aware pruning, the pruned messages are
+ *    sent as-is rather than dropping messages (which would cause context forgetting).
  * 6. Target: user-configurable via `proactiveBudgetLimit` config. 0 = disabled.
- *    Default: 0 (disabled). Recommended range: 25_000–100_000.
+ *    Default: 100_000. Recommended range: 25_000–100_000.
  */
 
 import type { Message } from '../../types/message.js'
@@ -221,7 +221,7 @@ export function pruneRedundantToolOutputs(
     let workingContent: typeof content | undefined
     let changed = false
 
-    for (let bi = 0; bi < content.length; bi++) {
+    for (let bi = content.length - 1; bi >= 0; bi--) {
       const block = content[bi]!
       if (block.type !== 'tool_result') continue
 
@@ -287,7 +287,8 @@ export function pruneRedundantToolOutputs(
  * causing the model to forget where it was).
  *
  * Reads `proactiveBudgetLimit` from user config:
- *  - 0 or undefined = disabled (send full context, original behavior)
+ *  - 0 = disabled (send full context, original behavior)
+ *  - undefined = uses default (100K)
  *  - positive number = target token budget (e.g. 50000 = try to stay under 50K)
  */
 export function applyProactiveBudget(
