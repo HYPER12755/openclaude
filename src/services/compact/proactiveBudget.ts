@@ -48,17 +48,39 @@ export const PROACTIVE_BUDGET_TARGET_TOKENS_DEFAULT = 100_000
 
 /**
  * Tools whose outputs contain file contents that become stale between turns.
- * Only these tools are candidates for content stripping.
+ * Only Read is included — Write/Edit acknowledgments are tiny and not worth
+ * stripping (they cost ~10-20 tokens and the model may reference them).
  */
-export const FILE_CONTENT_TOOLS = new Set(['Read', 'Write', 'Edit'])
+export const FILE_CONTENT_TOOLS = new Set(['Read'])
+
+/**
+ * Tools whose output is dedup-based: only strip when the same identity
+ * (command/pattern/url) was re-run. A safety cap prevents pathological
+ * accumulation of many unique results.
+ */
+export const DEDUP_TOOLS = new Set(['Bash', 'Grep', 'Glob', 'WebFetch'])
+
+/**
+ * Safety cap: maximum unique tool results to keep per tool type.
+ * Prevents context explosion when agent runs many different commands
+ * (e.g. 50 unique greps). Dedup handles normal cases; cap handles edge cases.
+ */
+export const SAFETY_CAP = 20
+
+/**
+ * Number of most recent user messages within which tool results are NEVER
+ * stripped. The model is most likely to reference results it just produced.
+ */
+export const RECENCY_GUARD_TURNS = 5
 
 /**
  * Generate a marker for a stripped tool result.
- * Includes the file path so the model can locate the latest read in context.
+ * Includes a descriptive label so the model can locate the latest result in
+ * context or re-run the tool if needed.
  * Kept short to minimize token overhead.
  */
-export function strippedMarker(filePath: string): string {
-  return `[Content from earlier read of ${filePath} — see latest result in context]`
+export function strippedMarker(label: string): string {
+  return `[Content from earlier ${label} — see latest result in context]`
 }
 
 // ---------------------------------------------------------------------------
@@ -158,14 +180,104 @@ export function isLargeContent(content: unknown): boolean {
 }
 
 /**
- * Replace a tool_result block's content with a file-aware marker.
+ * Generate a human-readable label for a tool result, used in the stripped
+ * marker so the model can identify what was removed.
+ */
+export function getResultLabel(
+  toolName: string,
+  input: Record<string, unknown>,
+): string {
+  switch (toolName) {
+    case 'Read':
+    case 'Write':
+    case 'Edit': {
+      const fp = input.file_path
+      if (typeof fp === 'string' && fp.length > 0) return `read of ${fp}`
+      return `${toolName} result`
+    }
+    case 'Bash': {
+      const cmd = input.command
+      if (typeof cmd === 'string') return `command: ${cmd.slice(0, 120)}`
+      return 'Bash result'
+    }
+    case 'Grep': {
+      const pattern = input.pattern
+      if (typeof pattern === 'string') return `grep: ${pattern.slice(0, 120)}`
+      return 'Grep result'
+    }
+    case 'Glob': {
+      const pattern = input.pattern
+      if (typeof pattern === 'string') return `glob: ${pattern.slice(0, 120)}`
+      return 'Glob result'
+    }
+    case 'WebFetch': {
+      const url = input.url
+      if (typeof url === 'string') return `fetch: ${url.slice(0, 120)}`
+      return 'WebFetch result'
+    }
+    default:
+      return `${toolName} result`
+  }
+}
+
+/**
+ * Extract a stable identity for dedup-based pruning.
+ *
+ * Different tools use different parameters to identify what resource they
+ * operate on:
+ *   Bash   → command
+ *   Grep   → pattern[:path]
+ *   Glob   → pattern[:path]
+ *   WebFetch → url
+ *
+ * Returns a namespaced identity string or undefined when no identity
+ * can be determined.
+ */
+export function getResourceIdentity(
+  toolName: string,
+  input: Record<string, unknown>,
+): string | undefined {
+  switch (toolName) {
+    case 'Bash': {
+      const cmd = input.command
+      if (typeof cmd === 'string' && cmd.length > 0) return `cmd:${cmd}`
+      return undefined
+    }
+    case 'Grep': {
+      const pattern = input.pattern
+      if (typeof pattern === 'string' && pattern.length > 0) {
+        const path = input.path
+        return `grep:${pattern}|${typeof path === 'string' ? path : ''}`
+      }
+      return undefined
+    }
+    case 'Glob': {
+      const pattern = input.pattern
+      if (typeof pattern === 'string' && pattern.length > 0) {
+        const path = input.path
+        return `glob:${pattern}|${typeof path === 'string' ? path : ''}`
+      }
+      return undefined
+    }
+    case 'WebFetch': {
+      const url = input.url
+      if (typeof url === 'string' && url.length > 0) return `url:${url}`
+      return undefined
+    }
+    default:
+      return undefined
+  }
+}
+
+/**
+ * Replace a tool_result block's content with a marker.
  * Modifies the block in-place.
  */
 export function stripToolResultContent(
   block: Record<string, unknown>,
-  filePath: string,
+  label: string,
 ): void {
-  const marker = strippedMarker(filePath)
+  const marker = strippedMarker(label)
   if (typeof block.content === 'string') {
     block.content = marker
   } else if (Array.isArray(block.content)) {
@@ -184,41 +296,88 @@ export function stripToolResultContent(
  * 1. First pass → build tool_use_id → {name, input} map from assistant
  *    messages.
  * 2. Second pass (backwards) → track which file_paths have been seen in
- *    newer messages. When a tool_result's file_path has already been seen,
- *    strip its content.
+ *    newer messages. When a tool_result's file_path has already been seen
+ *    in a newer full read, strip its content.
+ *
+ * Only the latest full Read per file is preserved. Older reads for the
+ * same file are stripped as redundant — the model only needs the most
+ * recent file snapshot.
  *
  * This preserves ALL user messages, assistant reasoning, and decisions.
  * Only the content of old redundant tool_result blocks is replaced.
  */
 export function pruneRedundantToolOutputs(
-  messages: Message[],
+  messages: Message[] | readonly Message[],
   toolUseMap: Map<string, ToolUseMeta>,
+  recencyGuard = RECENCY_GUARD_TURNS,
 ): { messages: Message[]; strippedCount: number } {
   const seenFilePaths = new Set<string>()
+  const seenIdentities = new Map<string, number>() // identity → count of unique results seen
+  const identityFirstSeen = new Map<string, number>() // identity → reversed index (for safety cap)
   let strippedCount = 0
+  const strippedToolUseIds = new Set<string>()
 
   // Walk messages backwards (newest first) so the most recent result per file
   // is seen first and preserved, while older results for the same file are
-  // stripped. We avoid cloning until we know a change is needed — for a
-  // conversation with hundreds of turns but only a few stale reads, this
-  // avoids O(n) deep clones on every call.
-  //
-  // The message array itself is shallow-copied, so the caller's
-  // reference is never mutated. Unchanged messages pass through as-is
-  // (same object identity). Only when a tool_result block needs stripping
-  // do we clone that message's content.
+  // stripped. We avoid cloning until we know a change is needed.
   const reversed = [...messages].reverse()
-  const result = reversed.map(msg => {
+
+  // Phase 1: First pass — count user messages from the end for recency guard.
+  // We need to know the index of each message in the reversed array to apply
+  // the recency guard (skip stripping results within the last N user messages).
+  let userMessageCount = 0
+  const reversedUserIndex = new Map<number, number>() // reversed index → user message count
+  for (let ri = 0; ri < reversed.length; ri++) {
+    const msg = reversed[ri]!
+    if (msg.type === 'user') {
+      reversedUserIndex.set(ri, userMessageCount)
+      userMessageCount++
+    }
+  }
+
+  const result = reversed.map((msg, ri) => {
+    // ── Assistant messages: strip tool_use blocks for stripped results ──
+    if (msg.type === 'assistant') {
+      if (strippedToolUseIds.size > 0) {
+        const content = msg.message.content
+        if (!Array.isArray(content)) return msg
+        let workingContent: typeof content | undefined
+        for (let bi = content.length - 1; bi >= 0; bi--) {
+          const block = content[bi]!
+          if (block.type !== 'tool_use') continue
+          const id = block.id as string
+          if (!strippedToolUseIds.has(id)) continue
+          const meta = toolUseMap.get(id)
+          const toolName = meta?.name ?? 'tool'
+          if (!workingContent) workingContent = [...content]
+          workingContent[bi] = {
+            type: 'text' as const,
+            text: `[tool_use: ${toolName} — paired result stripped as redundant]`,
+          }
+        }
+        if (workingContent) {
+          return {
+            ...msg,
+            message: { ...msg.message, content: workingContent },
+          } as Message
+        }
+      }
+      return msg
+    }
+
     if (msg.type !== 'user') return msg
+
+    // ── Recency guard: don't strip recent results, but still claim ─────
+    const userIdx = reversedUserIndex.get(ri) ?? userMessageCount
+    const canStrip = recencyGuard <= 0 || userIdx >= recencyGuard
 
     const content = msg.message.content
     if (!Array.isArray(content)) return msg
 
-    // Quick scan: does this message have any tool_result blocks?
     const hasToolResult = content.some(b => b.type === 'tool_result')
     if (!hasToolResult) return msg
 
-    // Track whether we need to clone. Start with the original reference.
+    // Lazy clone — only when a mutation is actually needed
     let workingContent: typeof content | undefined
     let changed = false
 
@@ -232,43 +391,72 @@ export function pruneRedundantToolOutputs(
       const meta = toolUseMap.get(toolUseId)
       if (!meta) continue
 
-      // Only process file-content tools (Read, Write, Edit)
-      if (!FILE_CONTENT_TOOLS.has(meta.name)) continue
+      // Only process tools in FILE_CONTENT_TOOLS or DEDUP_TOOLS
+      const isFileTool = FILE_CONTENT_TOOLS.has(meta.name)
+      const isDedupTool = DEDUP_TOOLS.has(meta.name)
+      if (!isFileTool && !isDedupTool) continue
 
       const filePath = getFilePathFromInput(meta.input)
-      if (!filePath) continue
+      const identity = isDedupTool ? getResourceIdentity(meta.name, meta.input) : undefined
 
-      // If this file was already claimed by a MORE RECENT full-coverage Read,
-      // this older result is redundant — strip it.
-      // Only full Reads (no offset/limit, with actual content) claim a file.
-      // Edit/Write acks, partial reads, and stubs do NOT supersede earlier
-      // full reads — otherwise the model would lose the file snapshot.
-      if (seenFilePaths.has(filePath)) {
+      // ── Should we strip this result? ─────────────────────────────────
+
+      let shouldStrip = false
+
+      // Check 1: File-path redundancy (Read) — a newer full Read has
+      // already covered this file.
+      if (isFileTool && filePath && seenFilePaths.has(filePath)) {
+        shouldStrip = true
+      }
+
+      // Check 2: Dedup-based — strip when the same identity was seen in
+      // a newer result. Claiming is handled below alongside Read claiming.
+      if (!shouldStrip && isDedupTool && identity) {
+        if (seenIdentities.has(identity)) {
+          // Duplicate: same command/pattern/url was re-run → strip
+          shouldStrip = true
+        } else if (identityFirstSeen.size >= SAFETY_CAP) {
+          // Safety cap hit: strip even unique results beyond the cap
+          shouldStrip = true
+        }
+      }
+
+      if (shouldStrip && canStrip) {
+        // ── Strip this result ──────────────────────────────────────────
         if (isLargeContent(block.content)) {
-          // Lazy clone: only copy when we actually need to mutate
           if (!workingContent) {
             workingContent = structuredClone(content) as typeof content
           }
+          const label = getResultLabel(meta.name, meta.input)
           stripToolResultContent(
             workingContent[bi] as unknown as Record<string, unknown>,
-            filePath,
+            label,
           )
           changed = true
           strippedCount++
+          strippedToolUseIds.add(toolUseId)
         }
-      } else if (
-        // Only full Reads with actual content claim the file as "covered".
-        // Partial reads (offset/limit), Edit/Write acks, and small stubs
-        // don't provide a complete file snapshot and therefore shouldn't
-        // supersede older results.
-        meta.name === 'Read' &&
-        meta.input.offset === undefined &&
-        meta.input.limit === undefined &&
-        isLargeContent(block.content)
-      ) {
-        // First time seeing this file in the reverse walk = MOST RECENT
-        // full-coverage result. Mark it so older redundant reads get stripped.
-        seenFilePaths.add(filePath)
+      } else if (isLargeContent(block.content)) {
+        // ── Claim resources for future redundancy detection ────────────
+        // Always claim regardless of recency guard — this ensures that
+        // older duplicates get detected even when the most recent result
+        // is within the recency window.
+        if (isFileTool && meta.name === 'Read' && filePath) {
+          // Full Read claims the file_path — older reads for the same file
+          // get stripped. (Partial reads with offset/limit skip claiming.)
+          if (meta.input.offset === undefined && meta.input.limit === undefined) {
+            seenFilePaths.add(filePath)
+          }
+        }
+        if (isDedupTool && identity && !seenIdentities.has(identity)) {
+          // Claim identity even when canStrip is false — this ensures
+          // older duplicates outside the recency guard get detected.
+          const uniqueCount = identityFirstSeen.size
+          if (uniqueCount < SAFETY_CAP) {
+            seenIdentities.set(identity, 1)
+            identityFirstSeen.set(identity, ri)
+          }
+        }
       }
     }
 
@@ -283,8 +471,85 @@ export function pruneRedundantToolOutputs(
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Phase 2: Thinking block pruning
 // ---------------------------------------------------------------------------
+
+/**
+ * Walk messages backwards and strip old thinking blocks from assistant
+ * messages, keeping only the most recent one.
+ *
+ * Qwen3.6 and other reasoning models produce massive thinking blocks
+ * (often 10K+ tokens per turn). Old thinking is redundant — only the
+ * latest reasoning chain matters for the current context. Stripping old
+ * thinking blocks saves significant tokens while preserving all tool_use
+ * and text blocks (the actual decisions and actions).
+ *
+ * Algorithm:
+ * 1. Walk messages backwards (newest → oldest).
+ * 2. Track whether we've seen a thinking block.
+ * 3. The first (most recent) assistant message with thinking is kept intact.
+ * 4. All older assistant messages have their thinking/redacted_thinking
+ *    blocks stripped, preserving text and tool_use blocks.
+ * 5. If a message has ONLY thinking blocks (no text/tool_use), it gets a
+ *    minimal placeholder so the message structure is preserved.
+ */
+export function pruneOldThinkingBlocks(
+  messages: Message[],
+): { messages: Message[]; strippedCount: number } {
+  let hasSeenThinking = false
+  let strippedCount = 0
+
+  const reversed = [...messages].reverse()
+  const result = reversed.map(msg => {
+    if (msg.type !== 'assistant') return msg
+
+    const content = msg.message.content
+    if (!Array.isArray(content)) return msg
+
+    // Check if this message has thinking blocks
+    const hasThinking = content.some(
+      (block: any) => block.type === 'thinking' || block.type === 'redacted_thinking',
+    )
+    if (!hasThinking) return msg
+
+    if (!hasSeenThinking) {
+      // This is the most recent assistant message with thinking — keep it
+      hasSeenThinking = true
+      return msg
+    }
+
+    // Strip thinking blocks from this older message
+    const filtered = content.filter(
+      (block: any) => block.type !== 'thinking' && block.type !== 'redacted_thinking',
+    )
+
+    if (filtered.length === content.length) return msg // No thinking blocks to strip (shouldn't happen since hasThinking was true)
+
+    strippedCount++
+
+    if (filtered.length === 0) {
+      // All blocks were thinking — keep a minimal placeholder so the
+      // message structure is preserved and the model doesn't lose a turn.
+      return {
+        ...msg,
+        message: {
+          ...msg.message,
+          content: [{ type: 'text' as const, text: '[thinking stripped]' }],
+        },
+      } as Message
+    }
+
+    return {
+      ...msg,
+      message: {
+        ...msg.message,
+        content: filtered,
+      },
+    } as Message
+  })
+
+  return { messages: result.reverse(), strippedCount }
+}
 
 /**
  * Apply proactive message budgeting to strip redundant tool outputs.
@@ -345,20 +610,26 @@ export function applyProactiveBudget(
     }
   }
 
-  // Content-aware pruning: strip old redundant tool outputs.
-  // This is the ONLY phase — we NEVER drop messages. Content-aware pruning
-  // preserves ALL user messages and assistant reasoning, only replacing old
-  // tool result content with a short marker. The model keeps full context
+  // Phase 1: Content-aware pruning — strip old redundant tool outputs.
+  // This preserves ALL user messages and assistant reasoning, only replacing
+  // old tool result content with a short marker. The model keeps full context
   // awareness. If still over budget after pruning, we send what we have
   // rather than dropping messages (which caused context forgetting).
   const toolUseMap = buildToolUseMap(messages)
   const { messages: prunedMessages, strippedCount } =
     pruneRedundantToolOutputs(messages, toolUseMap)
 
+  // Phase 2: Strip old thinking blocks from older assistant messages.
+  // Reasoning models (Qwen3.6, DeepSeek, etc.) produce massive thinking
+  // blocks that are redundant across turns — only the latest reasoning
+  // chain matters. This preserves all text and tool_use blocks.
+  const { messages: finalMessages, strippedCount: thinkingStripped } =
+    pruneOldThinkingBlocks(prunedMessages)
+
   return {
-    messages: prunedMessages,
-    wasPruned: strippedCount > 0,
-    estimatedTokens: roughTokenCountEstimationForMessages(prunedMessages),
-    strippedCount,
+    messages: finalMessages,
+    wasPruned: strippedCount > 0 || thinkingStripped > 0,
+    estimatedTokens: roughTokenCountEstimationForMessages(finalMessages),
+    strippedCount: strippedCount + thinkingStripped,
   }
 }
