@@ -8,27 +8,29 @@ Date: 2026-07-13
 
 ## Executive Summary
 
-The core performance issue is that **OpenClaude sends the full session conversation history to the API on every single turn**. This means every user message, every tool result, every assistant response — the entire transcript since session start — is included in each API request. What should be a 2-second reply takes 60+ minutes because the context window fills up rapidly and compaction is reactive (only fires when the window is nearly full) rather than proactive.
+The core performance issue was that **OpenClaude historically sent the full session conversation history to the API on every single turn** (prior to the proactive budget feature). This meant every user message, every tool result, every assistant response — the entire transcript since session start — was included in each API request. What should be a 2-second reply could take much longer because the context window fills up rapidly and compaction was reactive (only fires when the window is nearly full) rather than proactive.
+
+**Note:** This analysis was conducted before the `applyProactiveBudget` feature was implemented. The current implementation now strips old redundant Read/Write/Edit tool results before each API call, reducing token count while preserving all messages. See `context-pipeline.md` for the updated pipeline.
 
 The other three projects (opencode, kilocode, kimi-code) all use **aggressive proactive context management** — they compact, prune, or budget the message list *before* each API call, keeping only the relevant portion.
 
-**Performance ordering (fastest to slowest):**
-1. **opencode** — fastest: two-layer compaction (summary + tail) + aggressive tool output pruning
-2. **kilocode** — slightly slower than opencode: same architecture + additional overflow capping
-3. **kimi-code** — similar to OpenClaude: uses FullCompaction with strategy patterns, reactive
-4. **OpenClaude** — slowest: sends full session context every turn, compaction is reactive
+**Hypothesized performance ordering (fastest to slowest) — unverified, based on architecture review without reproducible benchmarks:**
+1. **opencode** — two-layer compaction (summary + tail) + aggressive tool output pruning
+2. **kilocode** — same architecture as opencode + additional overflow capping
+3. **kimi-code** — uses FullCompaction with strategy patterns, reactive
+4. **OpenClaude** — historically sent full session context every turn, compaction was reactive (pre-proactive-budget baseline)
 
 ---
 
 ## Key Findings
 
-### 1. OpenClaude: Full Session Context Every Turn
+### 1. OpenClaude: Full Session Context Every Turn (Pre-Proactive-Budget Baseline)
 
-**What happens:**
-- Every API request includes ALL messages from the session transcript since session start
-- `normalizeMessagesForAPI()` in `src/utils/messages.ts` (4117 lines) processes the full message list
-- It filters out some message types (progress, system, synthetic errors) but does NOT limit how far back in history it goes
-- The message list is gathered from the entire session with no built-in budget/limit
+**What happened (before proactive budget feature):**
+- Every API request included ALL messages from the session transcript since session start
+- `normalizeMessagesForAPI()` in `src/utils/messages.ts` (4117 lines) processed the full message list
+- It filtered out some message types (progress, system, synthetic errors) but did NOT limit how far back in history it went
+- The message list was gathered from the entire session with no built-in budget/limit
 
 **Compaction (reactive, not proactive):**
 - `src/services/compact/autoCompact.ts` checks if context is nearly full and triggers compaction
@@ -37,11 +39,13 @@ The other three projects (opencode, kilocode, kimi-code) all use **aggressive pr
 - This means compaction only triggers AFTER the context is almost full, not before
 - By the time compaction fires, the API has already been called with the full context multiple times
 
-**Key problem:**
+**Key problem (pre-proactive-budget baseline):**
 - No proactive budget for how many recent messages/tokens to include
 - No "tail-only" approach — everything goes in until compaction fires
 - Compaction is a complex, expensive agent-driven process (runs a sub-agent to summarize)
 - `normalizeMessagesForAPI` is a massive function (4117-line file) that processes ALL messages
+
+**Current state:** The `applyProactiveBudget` feature now strips old redundant Read/Write/Edit tool results before each API call, reducing token count while preserving all messages. This runs before all other compaction steps. See `context-pipeline.md` for the full updated pipeline.
 
 ### 2. opencode: Proactive Two-Layer Context Management
 
